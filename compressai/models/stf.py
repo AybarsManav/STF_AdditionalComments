@@ -41,23 +41,27 @@ class Mlp(nn.Module):
 
 def window_partition(x, window_size):
     B, H, W, C = x.shape
+    # x: B, number of vertical windows, windowsize vertically, number of horizontal windows, windows horizontally, C
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    # each window is considered as a new image in the batch, so windows: B*num_windows_vertical*num_windows_horizontal,window_size,window_size,C
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
 
 
 def window_reverse(windows, window_size, H, W):
+    # Getting the original batch size back by dividing the current B to num_windows_vertical*num_windows_horizontal
     B = int(windows.shape[0] / (H * W / window_size / window_size))
+    # x: original B, num_windows_vertical,num_windows_horizontal,window_size,window_size,C
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1) # getting back original x before window_partition()
     return x
 
 class WindowAttention(nn.Module):
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
-
+    
         super().__init__()
         self.dim = dim
-        self.window_size = window_size  # Wh, Ww
+        self.window_size = window_size  # Wh, Ww -> It is a tuple
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
@@ -93,30 +97,35 @@ class WindowAttention(nn.Module):
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
-        B_, N, C = x.shape
+        B_, N, C = x.shape # B_ is probably the new batch size after windows partition, and W,H are the height and width of the each window
+        # qkv: 3,B,num_heads,H*W,head_dim
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+        # q,k,v: B,num_heads,H*W,head_dim
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
         q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
+        # k.transpose(-2,-1): B,num_heads,head_dim,H*W
+        attn = (q @ k.transpose(-2, -1)) # attn:B, num_heads, H*W , H*W 
+        # Sequence length is num of pixels and each element is represented by head_dim dimensional vectors
 
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-        attn = attn + relative_position_bias.unsqueeze(0)
+        attn = attn + relative_position_bias.unsqueeze(0) # Relative Positional Encoding
 
-        if mask is not None:
-            nW = mask.shape[0]
+        if mask is not None: # Is mask used if there is no window_partition ? 
+            nW = mask.shape[0] # mask: Nw, N, N 
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
         else:
             attn = self.softmax(attn)
-
+         
         attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
+        # v: B, num_heads, H*W, head_dim
+        # (attn @ v).transpose(1,2): B, H*W , num_heads, head_dim
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C) # heads are concatenated
+        x = self.proj(x) # x: B_, H*W, C -- since proj has in_dims = out_dims
         x = self.proj_drop(x)
         return x
 
@@ -151,7 +160,7 @@ class SwinTransformerBlock(nn.Module):
         H, W = self.H, self.W
         assert L == H * W, "input feature has wrong size"
 
-        shortcut = x
+        shortcut = x # shortcut: B, H*W, C
         x = self.norm1(x)
         x = x.view(B, H, W, C)
 
@@ -160,10 +169,12 @@ class SwinTransformerBlock(nn.Module):
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
-        _, Hp, Wp, _ = x.shape
+        _, Hp, Wp, _ = x.shape # Hp and Wp are padded height and width
 
         # cyclic shift
         if self.shift_size > 0:
+            # Shifts the pixels horizotanlly and vertically by shift_size i.e. x[0,2,2,:] == x_shifted[0,0,0,:]
+            # It should be equivalent to shifting the windows
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
             attn_mask = mask_matrix
         else:
@@ -172,6 +183,7 @@ class SwinTransformerBlock(nn.Module):
 
         # partition windows
         x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+        # transform into a sequence
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
