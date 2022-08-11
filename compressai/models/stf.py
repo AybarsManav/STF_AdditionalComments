@@ -97,15 +97,15 @@ class WindowAttention(nn.Module):
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
-        B_, N, C = x.shape # B_ is probably the new batch size after windows partition, and W,H are the height and width of the each window
-        # qkv: 3,B,num_heads,H*W,head_dim
+        B_, N, C = x.shape # B_ is probably the new batch size after windows partition, and Ww,Wh are the height and width of the each window
+        # qkv: 3,B,num_heads,Ww*Wh,head_dim
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
-        # q,k,v: B,num_heads,H*W,head_dim
+        # q,k,v: B,num_heads,wH*wW,head_dim
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
         q = q * self.scale
         # k.transpose(-2,-1): B,num_heads,head_dim,H*W
-        attn = (q @ k.transpose(-2, -1)) # attn:B, num_heads, H*W , H*W 
+        attn = (q @ k.transpose(-2, -1)) # attn:B, num_heads, wH*wW , wH*wW 
         # Sequence length is num of pixels and each element is represented by head_dim dimensional vectors
 
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
@@ -113,9 +113,9 @@ class WindowAttention(nn.Module):
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
         attn = attn + relative_position_bias.unsqueeze(0) # Relative Positional Encoding
 
-        if mask is not None: # Is mask used if there is no window_partition ? 
-            nW = mask.shape[0] # mask: Nw, N, N 
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+        if mask is not None:  
+            nW = mask.shape[0] # mask: Nw, N, N -- 
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0) # mask: 1,Nw,1,N,N
             attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
         else:
@@ -174,12 +174,12 @@ class SwinTransformerBlock(nn.Module):
         # cyclic shift
         if self.shift_size > 0:
             # Shifts the pixels horizotanlly and vertically by shift_size i.e. x[0,2,2,:] == x_shifted[0,0,0,:]
-            # It should be equivalent to shifting the windows
+            # It is equivalent to shifting the windows
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
             attn_mask = mask_matrix
         else:
             shifted_x = x
-            attn_mask = None
+            attn_mask = None  # IF THERE IS NO SHIFT, MASKING IS NOT NEEDED
 
         # partition windows
         x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
@@ -233,16 +233,18 @@ class PatchMerging(nn.Module):
         pad_input = (H % 2 == 1) or (W % 2 == 1)
         if pad_input:
             x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
-
+        
+        # Slice x tensor to 4 patches i.e. each patch has H/2 W/2 height and width.
         x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
         x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
         x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
         x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
-        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
+        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C -- Concatenate them on channel dim
         x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
 
         x = self.norm(x)
-        x = self.reduction(x)
+        x = self.reduction(x) 
+        # x: B, H/2 , W/2, 2*C -- resolution down 4 times but channel increased to 2 times
 
         return x
 
@@ -263,12 +265,14 @@ class PatchSplit(nn.Module):
     def forward(self, x, H, W):
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
-
+        
         x = self.norm(x)
         x = self.reduction(x)           # B, L, C
         x = x.permute(0, 2, 1).contiguous().view(B, 2*C, H, W)
-        x = self.shuffle(x)             # B, C//2 ,2H, 2W
+        x = self.shuffle(x)             # B, C//2 ,2H, 2W -- With the help of pixelshuffle increases H and W by 2 while decreasing channel
+        # because we have doubled the channels, after shuffle channels are only halved
         x = x.permute(0, 2, 3, 1).contiguous().view(B, 4 * L, -1)
+        # x: B, 4*H*W, C/2
         return x
 
 class BasicLayer(nn.Module):
@@ -289,18 +293,18 @@ class BasicLayer(nn.Module):
                  inverse=False):
         super().__init__()
         self.window_size = window_size
-        self.shift_size = window_size // 2
+        self.shift_size = window_size // 2 # Fixed shift size
         self.depth = depth
         self.use_checkpoint = use_checkpoint
 
-        # build blocks
+        # build blockssh
         self.blocks = nn.ModuleList([
             SwinTransformerBlock(
 
                 dim=dim,
                 num_heads=num_heads,
                 window_size=window_size,
-                shift_size=0 if (i % 2 == 0) else window_size // 2,
+                shift_size=0 if (i % 2 == 0) else window_size // 2, #Shift is used every 2 transformer blocks
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
                 qk_scale=qk_scale,
@@ -325,8 +329,8 @@ class BasicLayer(nn.Module):
         """
 
         # calculate attention mask for SW-MSA
-        Hp = int(np.ceil(H / self.window_size)) * self.window_size
-        Wp = int(np.ceil(W / self.window_size)) * self.window_size
+        Hp = int(np.ceil(H / self.window_size)) * self.window_size # Padded H of spatial features
+        Wp = int(np.ceil(W / self.window_size)) * self.window_size # Padded W of spatial features
         img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)
         h_slices = (slice(0, -self.window_size),
                     slice(-self.window_size, -self.shift_size),
@@ -335,11 +339,17 @@ class BasicLayer(nn.Module):
                     slice(-self.window_size, -self.shift_size),
                     slice(-self.shift_size, None))
         cnt = 0
+        # This will group the subwindow elements that were adjecent before cyclic shift.
         for h in h_slices:
             for w in w_slices:
                 img_mask[:, h, w, :] = cnt
                 cnt += 1
-
+                
+        '''After the shift, a batched window may
+        be composed of several sub-windows that are not adjacent
+        in the feature map, so a masking mechanism is employed to
+        limit self-attention computation to within each sub-window'''
+        
         mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
@@ -347,11 +357,11 @@ class BasicLayer(nn.Module):
 
         for blk in self.blocks:
             blk.H, blk.W = H, W
-            x = blk(x, attn_mask)
+            x = blk(x, attn_mask) # Mask is used every two blocks only when cyclic shift is used.
         if self.downsample is not None:
             x_down = self.downsample(x, H, W)
             if isinstance(self.downsample, PatchMerging):
-                Wh, Ww = (H + 1) // 2, (W + 1) // 2
+                Wh, Ww = (H + 1) // 2, (W + 1) // 2 # Due to padding in merger
             elif isinstance(self.downsample, PatchSplit):
                 Wh, Ww = H * 2, W * 2
             return x_down, Wh, Ww
@@ -388,7 +398,7 @@ class PatchEmbed(nn.Module):
             Wh, Ww = x.size(2), x.size(3)
             x = x.flatten(2).transpose(1, 2)
             x = self.norm(x)
-            x = x.transpose(1, 2).view(-1, self.embed_dim, Wh, Ww)
+            x = x.transpose(1, 2).view(-1, self.embed_dim, Wh, Ww) # x: B, C, Wh, Ww
 
         return x
 
@@ -436,7 +446,7 @@ class SymmetricalTransFormer(CompressionModel):
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             layer = BasicLayer(
-                dim=int(embed_dim * 2 ** i_layer),
+                dim=int(embed_dim * 2 ** i_layer), # multiplying embed_dim with 2 each layer.
                 depth=depths[i_layer],
                 num_heads=num_heads[i_layer],
                 window_size=window_size,
@@ -447,14 +457,16 @@ class SymmetricalTransFormer(CompressionModel):
                 attn_drop=attn_drop_rate,
                 drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                 norm_layer=norm_layer,
-                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None, # No patchmerging/downsampling after the last transformer layer
                 use_checkpoint=use_checkpoint,
                 inverse=False)
             self.layers.append(layer)
-
+        
+        # Reversing the depths and heads for decoder
         depths = depths[::-1]
         num_heads = num_heads[::-1]
         self.syn_layers = nn.ModuleList()
+        
         for i_layer in range(self.num_layers):
             layer = BasicLayer(
                 dim=int(embed_dim * 2 ** (3-i_layer)),
@@ -472,9 +484,10 @@ class SymmetricalTransFormer(CompressionModel):
                 use_checkpoint=use_checkpoint,
                 inverse=True)
             self.syn_layers.append(layer)
-
-        self.end_conv = nn.Sequential(nn.Conv2d(embed_dim, embed_dim * patch_size ** 2, kernel_size=5, stride=1, padding=2),
-                                      nn.PixelShuffle(patch_size),
+        
+        # De-embedding
+        self.end_conv = nn.Sequential(nn.Conv2d(embed_dim, embed_dim * patch_size ** 2, kernel_size=5, stride=1, padding=2), # Spatial dimensions stay the same
+                                      nn.PixelShuffle(patch_size), # H = H * patch_size, same for W and channels = channels / (patch_size ** 2)
                                       nn.Conv2d(embed_dim, 3, kernel_size=3, stride=1, padding=1),
                                       )
 
@@ -593,10 +606,10 @@ class SymmetricalTransFormer(CompressionModel):
 
     def forward(self, x):
         """Forward function."""
-        x = self.patch_embed(x)
+        x = self.patch_embed(x) # x: B, C, Wh, Ww 
 
-        Wh, Ww = x.size(2), x.size(3)
-        x = x.flatten(2).transpose(1, 2)
+        Wh, Ww = x.size(2), x.size(3) # Height and width of patches
+        x = x.flatten(2).transpose(1, 2) # x: B, Wh* Ww, C
         x = self.pos_drop(x)
         for i in range(self.num_layers):
             layer = self.layers[i]
